@@ -1,13 +1,12 @@
 """Replica della pipeline del preprint VitaStress (Figura 3) e della classificazione (sez. 5)."""
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score
-from sklearn.model_selection import LeaveOneGroupOut
+from sklearn.model_selection import GridSearchCV, LeaveOneGroupOut
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.tree import DecisionTreeClassifier
 from xgboost import XGBClassifier
@@ -26,6 +25,10 @@ LABEL_RULE = "start"
 #   "experiment" -> dalla prima all'ultima annotation;
 #   "recording" -> tutta la registrazione
 ZSCORE_BASE = "phases"
+# assi dell'accelerometro da invertire per i soggetti col braccialetto ruotato di 180° attorno a X.
+# Vuoto = dati come pubblicati (riproduzione del paper); correzione: {"ddca342b": ["accY", "accZ"]}
+FLIPPED_AXES = {"ddca342b": ["accY", "accZ"]}
+#FLIPPED_AXES = {}
 
 WINDOW = pd.Timedelta("30s")  # "resampled to have a sampling frequency of 1/30 seconds" (sez. 3.6)
 
@@ -52,13 +55,15 @@ TASKS = {
                 "cognitive": "cognitive+public", "public": "cognitive+public"},
 }
 
-CLASSIFIERS = {  # i 6 del paper (sez. 3.6), con iperparametri fissi invece della grid search
-    "RF": lambda: RandomForestClassifier(n_estimators=100, random_state=42),
-    "LDA": lambda: LinearDiscriminantAnalysis(),
-    "kNN": lambda: KNeighborsClassifier(n_neighbors=9),  # k=9 come in WESAD
-    "DT": lambda: DecisionTreeClassifier(max_depth=5, min_samples_leaf=5, random_state=42),
-    "LR": lambda: LogisticRegression(max_iter=1000),
-    "XGB": lambda: XGBClassifier(random_state=42),
+# i 6 classificatori del paper (sez. 3.6) con la griglia di iperparametri della grid search
+# (il paper non riporta le griglie: queste sono piccole e scelte da noi)
+CLASSIFIERS = {
+    "RF": (RandomForestClassifier(random_state=42), {"n_estimators": [100, 300], "max_depth": [None, 10]}),
+    "LDA": (LinearDiscriminantAnalysis(solver="lsqr"), {"shrinkage": [None, "auto"]}),
+    "kNN": (KNeighborsClassifier(), {"n_neighbors": [3, 5, 9, 15]}),
+    "DT": (DecisionTreeClassifier(random_state=42), {"max_depth": [3, 5, 10, None]}),
+    "LR": (LogisticRegression(max_iter=1000), {"C": [0.01, 0.1, 1, 10]}),
+    "XGB": (XGBClassifier(random_state=42, n_jobs=1), {"n_estimators": [100, 300], "max_depth": [3, 6]}),
 }
 
 
@@ -108,6 +113,9 @@ def subject_table(subject_dir, label_rule, zscore_base):
     # "<uuid>_temperature.csv" -> "temperature.csv" (non confonde heat_flux_sensor_temperature)
     files = {f.name.split("_", 1)[1]: f for f in subject_dir.iterdir() if "_" in f.name}
     windows = subject_windows(files)
+    for subject, axes in FLIPPED_AXES.items():
+        if subject in subject_dir.name:  # invertire il segno cambia solo la media, non std e var
+            windows[[f"{axis}_mean" for axis in axes]] *= -1
     intervals, first, last = phase_intervals(files["annotation.csv"])
 
     start_times, end_times = windows.index, windows.index + WINDOW
@@ -130,14 +138,22 @@ def build_table(label_rule=LABEL_RULE, zscore_base=ZSCORE_BASE):
     return pd.concat(tables).rename_axis("window_start").reset_index()
 
 
-def evaluate_loso(X, y, groups, make_classifier):
-    """Leave-one-subject-out: accuracy e macro-F1 di ogni fold (un soggetto di test per fold)."""
-    accs, f1s = [], []
+def loso_predictions(X, y, groups, classifier, grid):
+    """LOSO annidata: per ogni soggetto di test, la grid search sceglie gli iperparametri con
+    una LOSO interna sui soli soggetti di training; il modello migliore, riaddestrato su
+    tutti i soggetti di training, predice le finestre del soggetto di test."""
+    pred = np.empty_like(y)
     for train, test in LeaveOneGroupOut().split(X, y, groups):
-        pred = make_classifier().fit(X[train], y[train]).predict(X[test])
-        accs.append(accuracy_score(y[test], pred))
-        f1s.append(f1_score(y[test], pred, average="macro"))
-    return accs, f1s
+        search = GridSearchCV(classifier, grid, scoring="f1_macro", cv=LeaveOneGroupOut(), n_jobs=-1)
+        pred[test] = search.fit(X[train], y[train], groups=groups[train]).predict(X[test])
+    return pred
+
+
+def per_subject_scores(y, pred, groups):
+    """Accuracy e macro-F1 di ogni soggetto, cioè di ogni fold della LOSO."""
+    df = pd.DataFrame({"y": y, "pred": pred, "subject": groups})
+    return df.groupby("subject").apply(lambda d: pd.Series({
+        "acc": accuracy_score(d["y"], d["pred"]), "f1": f1_score(d["y"], d["pred"], average="macro")}))
 
 
 def evaluate_all(table):
@@ -149,11 +165,12 @@ def evaluate_all(table):
         y = table["phase"].map(mapping).factorize(sort=True)[0]  # classi -> 0..n-1 (per XGBoost)
         for set_name, features in FEATURE_SETS.items():
             X = table[features].to_numpy()
-            for clf_name, make_classifier in CLASSIFIERS.items():
-                accs, f1s = evaluate_loso(X, y, table["subject"], make_classifier)
+            for clf_name, (classifier, grid) in CLASSIFIERS.items():
+                groups = table["subject"].to_numpy()
+                scores = per_subject_scores(y, loso_predictions(X, y, groups, classifier, grid), groups)
                 rows.append({"task": task, "features": set_name, "classifier": clf_name,
-                             "acc": np.mean(accs), "acc_std": np.std(accs),
-                             "f1": np.mean(f1s), "f1_std": np.std(f1s)})
+                             "acc": scores["acc"].mean(), "acc_std": scores["acc"].std(ddof=0),
+                             "f1": scores["f1"].mean(), "f1_std": scores["f1"].std(ddof=0)})
     return pd.DataFrame(rows)
 
 
