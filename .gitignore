@@ -1,0 +1,5 @@
+# pubblica solo il notebook
+*
+!.gitignore
+!README.md
+!pipeline.ipynb
